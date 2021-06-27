@@ -1,0 +1,6 @@
+# coding: utf-8
+# google datastore操作
+# op_datastore.py
+'''
+pip install --upgrade google-cloud-datastore
+'''
