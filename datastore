@@ -4,3 +4,336 @@
 '''
 pip install --upgrade google-cloud-datastore
 '''
+import configparser
+from gcloud import datastore
+import os, re
+from error_module import *
+from datetime import datetime
+import pandas as pd
+from op_json import *
+from op_db import *
+import time
+from tqdm import tqdm
+import datetime
+from op_df import *
+
+# config-------------------------------------------------------------
+# key file
+inifile = configparser.ConfigParser()
+inifile.read(os.environ.get('PATH_SCRIPT_ROOT') + '/conf/conf.ini')
+project = inifile.get("gcp", "project")
+key_file_path = os.environ.get('PATH_SCRIPT_ROOT') + '/' + inifile.get("common", "GOOGLE_APPLICATION_CREDENTIALS")
+project = 'aaaa'
+
+
+class DataStore:
+    def __init__(self, namespace='bunseki_dev', project=project):
+        self.client = datastore.Client.from_service_account_json(
+            os.path.join(os.path.dirname(__file__), key_file_path),
+            project=project, namespace=namespace)
+
+    # 複数キーで抽出 戻り値はentity形式
+    '''
+    key : e.key.name
+    property : dict(e)
+    '''
+
+    def get_from_keys(self, kind_name, keys):
+
+        keys_edits = [self.client.key(kind_name, k) for k in keys]
+        r = self.client.get_multi(keys_edits)
+        # a= [dict(e).update({'key':e.key.name}) for e in r]
+        # a = [[e.key.name,dict(e)] for e in r]
+        return r
+
+    # count
+    def Count(self, kind_name, filters=False, ky_filter=False):
+        kys = self.Select(kind_name, filters=filters, sort_keys=False, ky_filter=ky_filter, keys_only=True)
+        return len(kys)
+
+    # uniqueチェック
+    def is_unique(self, lists):
+        '''
+        uniqueチェック
+        :param lists:
+        :return:
+        '''
+        ''''''
+        is_unique = len(lists) == len(set(lists))
+        if not is_unique:
+            print([x for x in set(lists) if lists.count(x) > 1])
+        return is_unique
+
+    # keyもしくはpropertyで抽出  戻り値はentity形式
+    def Select(self, kind_name, filters=False, sort_keys=False, ky_filter=False, keys_only=False):
+
+        entitys = None
+        try:
+            query = self.client.query(kind=kind_name)
+            # where
+            if filters:
+                for q in filters:
+                    query.add_filter(q[0], q[1], q[2])
+
+            if sort_keys:
+                if sort_keys[1] == 'asc':
+                    query.order = [sort_keys[0]]
+                else:
+                    query.order = ['-' + sort_keys[0]]
+
+            if ky_filter:
+                query.key_filter(self.client.key(kind_name, ky_filter), '=')
+
+            if keys_only:
+                query.keys_only()
+
+            entitys = [entity for entity in query.fetch()]
+        except:
+            error_print()
+
+        return entitys
+
+    def Delete_memcache(self, ky):
+        self.client.delete(ky, seconds=0, namespace=None)
+
+    # Import list形式
+    def Import(self, kind_name, kys, vs, exclude_from_indexes, put_num_per_once=500):
+
+        # ユニークチェック
+        if not self.is_unique(kys):
+            print('kysがユニークになっていません。')
+            return False
+
+        # 大量誤write対策
+        if len(kys) > 10000000:
+            print('insert件数が多すぎます。%s件' % len(vs))
+        else:
+            # 1.edit
+            entitys = []
+            # entity分ループ
+            for ky, v in zip(kys, vs):
+                entity = datastore.Entity(self.client.key(kind_name, ky), exclude_from_indexes=(exclude_from_indexes))
+                # property分ループ
+                for prop in v:
+                    entity[prop[0]] = prop[1]  # 0:property_name 1:value
+                entitys.append(entity)
+
+            # 2.一括insert 100ずつ入れる
+            # エラー1：400 too big entityは1entityのサイズが1MBを超えた場合のエラー
+            # エラー2：途中で固まる　500→50に変更すると解消された　1回に投げる量が多いと固まる　同一キーが原因でははない
+
+            N = put_num_per_once
+            for i in tqdm(range(0, len(entitys), N)):
+                # for i in range(0, len(entitys), N):
+                #     print(i)
+                time.sleep(1)
+                self.client.put_multi(entitys[i: i + N])
+
+    # Import df 1行 1entity
+    def Import_df(self, kind_name, ky, df, exclude_from_indexes, put_num_per_once=500):
+
+        # 1.edit
+        entitys = []
+        cols = df.keys()  # カラム名
+        for i, v in df.iterrows():
+            entity = datastore.Entity(self.client.key(kind_name, str(v[ky])), exclude_from_indexes=(exclude_from_indexes))
+
+            # カラム数分ループ
+            for col in cols:
+                if col != ky:
+                    entity[str(col)] = v[col]  # 0:property_name 1:value
+            entitys.append(entity)
+
+        # 2.一括insert
+        N = put_num_per_once
+        for i in tqdm(range(0, len(entitys), N)):
+            # if i < 17 * N: continue
+            # if i < 1001: continue  # 8400-8425
+            time.sleep(1)
+            try:
+                # a = entitys[i: i + N]
+                self.client.put_multi(entitys[i: i + N])
+                '''マルチスレッド（Mypoolが多いと）実行だと Connection reset by peerエラーが出る'''
+                # self.client.put_multi(entitys[i: i + 10])
+
+            except:
+                print(i, i + N)
+                print(entitys[i: i + N])
+                error_print()
+                raise
+
+    # Import df 全行 1entity まとめる
+    def Import_sql_json(self, kind_name, ky, sql):
+        # 1.data get
+        df = select_df_pg(sql)
+
+        # 2.json
+        df_json = df.to_json(
+            force_ascii=False  # 日本語化
+            , orient='records', lines=False)
+
+        # 3.make data
+        props = [
+            [
+                ["json", df_json],
+                ["last_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+            ]
+        ]
+        self.Import(kind_name=kind_name, kys=[ky], vs=props, exclude_from_indexes=['json', 'last_update'])
+
+    # datastoreインサート用データフレーム分割
+    def ds_slicer(self, key, non_split_prop_names, split_prop_names, non_split_prop_values, split_prop_values, slice_num=50):
+        '''
+        :param key:
+        :param non_split_prop_names:分割しないデータの変数名　リスト形式
+        :param split_prop_names:　　分割するデータの変数名　リスト形式
+        :param non_split_prop_values:　分割しないデータの値　リスト形式
+        :param split_prop_values:　分割するデータの値　リスト形式
+        :param slice_num:　1分割の件数　
+        :return:
+        '''
+
+        non_split_prop_names.append('last_update')
+        non_split_prop_values.append(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        prop_names = non_split_prop_names + split_prop_names
+        data_types = []
+        for d in non_split_prop_values + split_prop_values:
+            # dfはjsonに変換
+            if isinstance(d, pd.DataFrame):
+                data_types.append('json')
+            elif isinstance(d, str):
+                data_types.append('str')
+            elif isinstance(d, int):
+                data_types.append('int')
+
+        # データフレーム分割
+        ct_rows = []
+        slice_df_edits = []
+        for df in split_prop_values:
+            tmp_slices = df_iterate_slicer(df, slice_num)
+            slice_df_edits.append(tmp_slices)
+            ct_rows.append(len(tmp_slices))
+
+        # 各エンティティごとのdf作成
+        df_entitys = []
+        # for i in range(self.slice_num):
+        for i in range(max(ct_rows)):
+            df_entity = []
+            df_entity = df_entity + non_split_prop_values
+            for slice_df_edit in slice_df_edits:
+                if len(slice_df_edit) > i:  # データフレームの行数確認
+                    df_entity.append(slice_df_edit[i])
+                else:
+                    df_entity.append(None)
+
+            df_entitys.append(df_entity)
+
+        # metaデータ作成
+        #      * per_slice: １分割当たりの件数
+        #      * max_slice: 全プロパティにおける最大分割数
+        #      * max_slice_current: 該当プロパティの分割数
+        meta = list_to_df(
+            ['split_type', 'data_type', 'prop_name', 'per_slice', 'max_slice', 'max_slice_current'],
+            [
+                ['non_split'] * len(non_split_prop_names) + ['split'] * len(split_prop_names),
+                data_types,
+                non_split_prop_names + split_prop_names,
+                slice_num,
+                max(ct_rows),
+                [1] * len(non_split_prop_names) + ct_rows
+            ])
+
+        # kys props作成
+        kys = []
+        props = []
+        for i, df_slice in enumerate(df_entitys):  # 各entityごと
+            prop = []
+            for prop_name, df in zip(prop_names, df_slice):  # 各dfごと
+                # dfはjsonに変換
+                if isinstance(df, pd.DataFrame):
+                    prop.append([prop_name, dataframe_to_json(df, record_type=True)])
+                else:
+                    prop.append([prop_name, df])
+
+            prop.append(['meta', dataframe_to_json(meta, record_type=True)])
+            props.append(prop)
+            kys.append(key + '___' + str(i))
+
+        return [kys, props]
+
+
+if __name__ == "__main__":
+    start = time.time()
+    st = DataStore(namespace='work')
+
+    # 複数キーで抽出---------------------
+    kind_name = 'ad'
+    keys = ['amazon__amazon']
+    entitys = st.get_from_keys(kind_name, keys)
+    print(entitys)
+
+    # # クエリーで抽出---------------------
+    # kind_name = 'work'
+    # filters = [
+    #           ['prop3', '=', '2']
+    #          ]
+    # filters = False
+    #
+    # sort_key = 'prop3'
+    # desc = 'asc'
+    # sort_keys = [sort_key, desc]
+    # sort_key = False
+    #
+    # ky_filter = 'ゲー'#keyでフィルター
+    # # ky_filter = False
+    #
+    # keys_only = False#keyのみの場合:True
+    #
+    # entitys = st.Select(kind_name, filters, sort_keys, ky_filter, keys_only)
+
+    # import---------------------
+    # kind_name = 'work'
+    # keys = ['kvvv11', 'kaaa22'] #key
+    # props = [
+    #     [['property_name1', 'kkk1'], ['property_name2', 11]], #kvvv11
+    #     [['property_name1', 'aaa1'], ['property_name2', ['配列1','配列2']]]  #kaaa22 配列OK　辞書はだめ
+    # ]
+    # exclude_from_indexes = ['meta','property_name1']
+    # st.Import(kind_name, keys, props, exclude_from_indexes) #[property_name, value_list]
+
+    # 単体
+    # kind_name = 'work'
+    # a = {"apple":1, "orange":2, "banana":3}
+    # ky = dict_to_json(a)
+    # keys = [ky] #key
+    # props = [
+    #     [
+    #         ['property_name1', 'kkk1'], ['property_name2', 11]
+    #     ]
+    # ]
+    # exclude_from_indexes = ['meta','property_name1']
+    # st.Import(kind_name, keys, props, exclude_from_indexes)
+
+    # df import 1行 1entity ---------------------
+    # kind_name = 'work'
+    # df = pd.DataFrame([[0, 1, 2], [3, 4, 'aa']],
+    #                     columns=['prop1', 'prop2', 'prop3'])
+    # ky = 'prop1'
+    # print(df)
+    # st.Import_df(kind_name, ky, df)
+
+    # # sql Import 全行 1entity---------------------
+    # sql = '''SELECT * FROM ms.ms_item limit 5'''
+    # ky = 'ms.ms_item__sentence_面白い'
+    # st.Import_sql_json(kind_name='work', ky=ky, sql=sql)
+    #
+    # print (("elapsed_time--:" + str(round((time.time() - start)/60, 0)) ) + "[m]")
+
+    # count---------------------
+    # ky_filter = '100001'
+    # ky_filter = False
+    # # value_filters = [['prop2', '=', '4']]
+    # filters = False
+    # ct = st.Count(kind_name='work', filters=filters, ky_filter=ky_filter)
+    # print(ct)
